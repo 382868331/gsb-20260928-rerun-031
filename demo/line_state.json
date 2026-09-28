@@ -1,0 +1,201 @@
+{
+  "config": {
+    "name": "两工位演示线",
+    "source_interval": 3.0,
+    "total_materials": 12,
+    "station_specs": [
+      {
+        "id": "S1",
+        "process_time": 3,
+        "failures": [
+          [
+            27,
+            5,
+            true,
+            "S1 卡料，当前件报废"
+          ]
+        ]
+      },
+      {
+        "id": "S2",
+        "process_time": 8,
+        "failures": [
+          [
+            14,
+            6,
+            false,
+            "S2 电机过热"
+          ]
+        ]
+      }
+    ],
+    "buffer_capacities": [
+      1,
+      2
+    ]
+  },
+  "clock": 22.0,
+  "scheduler": {
+    "now": 22.0,
+    "next_seq": 35,
+    "heap": [
+      {
+        "time": 25.0,
+        "seq": 34,
+        "type": "station.finish",
+        "target": "S2",
+        "data": {}
+      },
+      {
+        "time": 27.0,
+        "seq": 1,
+        "type": "station.fail",
+        "target": "S1",
+        "data": {
+          "duration": 5.0,
+          "scrap": true,
+          "reason": "S1 卡料，当前件报废"
+        }
+      }
+    ]
+  },
+  "seq": 5,
+  "produced": 1,
+  "scrapped": 0,
+  "loaded": 5,
+  "materials": {
+    "M001": {
+      "material_id": "M001",
+      "created_at": 0.0,
+      "status": "finished",
+      "finished_at": 11.0,
+      "scrapped_at": null,
+      "scrap_reason": null,
+      "location": "sink",
+      "route": [
+        "source",
+        "B0",
+        "S1",
+        "B1",
+        "S2",
+        "sink"
+      ]
+    },
+    "M002": {
+      "material_id": "M002",
+      "created_at": 0.0,
+      "status": "wip",
+      "finished_at": null,
+      "scrapped_at": null,
+      "scrap_reason": null,
+      "location": "S2",
+      "route": [
+        "source",
+        "B0",
+        "S1",
+        "B1",
+        "S2"
+      ]
+    },
+    "M003": {
+      "material_id": "M003",
+      "created_at": 3.0,
+      "status": "wip",
+      "finished_at": null,
+      "scrapped_at": null,
+      "scrap_reason": null,
+      "location": "B1",
+      "route": [
+        "source",
+        "B0",
+        "S1",
+        "B1"
+      ]
+    },
+    "M004": {
+      "material_id": "M004",
+      "created_at": 6.0,
+      "status": "wip",
+      "finished_at": null,
+      "scrapped_at": null,
+      "scrap_reason": null,
+      "location": "B1",
+      "route": [
+        "source",
+        "B0",
+        "S1",
+        "B1"
+      ]
+    },
+    "M005": {
+      "material_id": "M005",
+      "created_at": 11.0,
+      "status": "wip",
+      "finished_at": null,
+      "scrapped_at": null,
+      "scrap_reason": null,
+      "location": "B0",
+      "route": [
+        "source",
+        "B0"
+      ]
+    }
+  },
+  "buffers": [
+    {
+      "buffer_id": "B0",
+      "capacity": 1,
+      "slots": [
+        "M005"
+      ]
+    },
+    {
+      "buffer_id": "B1",
+      "capacity": 2,
+      "slots": [
+        "M003",
+        "M004"
+      ]
+    }
+  ],
+  "stations": [
+    {
+      "station_id": "S1",
+      "process_time": 3.0,
+      "state": "idle",
+      "material_id": null,
+      "remaining_time": 0.0,
+      "pre_down_state": "idle",
+      "failures": {
+        "schedule": [
+          [
+            27.0,
+            5.0,
+            true,
+            "S1 卡料，当前件报废"
+          ]
+        ],
+        "index": 0
+      }
+    },
+    {
+      "station_id": "S2",
+      "process_time": 8.0,
+      "state": "busy",
+      "material_id": "M002",
+      "remaining_time": 5.0,
+      "pre_down_state": "busy",
+      "failures": {
+        "schedule": [
+          [
+            14.0,
+            6.0,
+            false,
+            "S2 电机过热"
+          ]
+        ],
+        "index": 0
+      }
+    }
+  ]
+}
