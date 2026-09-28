@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 .env
 .env.*
+paused_line.json
 *.pem
 *.key
