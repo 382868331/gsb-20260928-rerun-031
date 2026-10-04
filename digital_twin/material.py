@@ -80,12 +80,13 @@ class DispositionRecord:
 @dataclass
 class Material:
     serial_number: str
-    material_type: str
     state: MaterialState
     location: str
+    material_type: str = "standard"
     route_step: int = 0
     rework_count: int = 0
     release_time: float = 0.0
+    visits: dict = field(default_factory=dict)
     history: list[HistoryEntry] = field(default_factory=list)
 
     def record(self, time: float, station: str, visit: int, action: str, **detail) -> None:
@@ -102,6 +103,7 @@ class Material:
             "route_step": self.route_step,
             "rework_count": self.rework_count,
             "release_time": self.release_time,
+            "visits": dict(self.visits),
             "history": [entry.to_dict() for entry in self.history],
         }
 
@@ -109,11 +111,48 @@ class Material:
     def from_dict(cls, data: dict) -> "Material":
         return cls(
             serial_number=data["serial_number"],
-            material_type=data["material_type"],
             state=MaterialState(data["state"]),
             location=data["location"],
+            material_type=data.get("material_type", "standard"),
             route_step=data.get("route_step", 0),
             rework_count=data.get("rework_count", 0),
             release_time=data.get("release_time", 0.0),
+            visits=dict(data.get("visits", {})),
             history=[HistoryEntry.from_dict(item) for item in data.get("history", [])],
+        )
+
+
+@dataclass
+class MaterialType:
+    """一类物料的工艺定义：路线、节拍、准备时间、抽检工位与返工上限。"""
+
+    name: str
+    route: tuple = ()
+    cycle_times: dict = field(default_factory=dict)
+    setup_time: float = 0.0
+    inspect_after: tuple = ()
+    max_reworks: int = 0
+
+    def cycle_time_for(self, station_name: str, default: float) -> float:
+        return float(self.cycle_times.get(station_name, default))
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "route": list(self.route),
+            "cycle_times": dict(self.cycle_times),
+            "setup_time": self.setup_time,
+            "inspect_after": list(self.inspect_after),
+            "max_reworks": self.max_reworks,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MaterialType":
+        return cls(
+            name=data["name"],
+            route=tuple(data.get("route", ())),
+            cycle_times=dict(data.get("cycle_times", {})),
+            setup_time=data.get("setup_time", 0.0),
+            inspect_after=tuple(data.get("inspect_after", ())),
+            max_reworks=data.get("max_reworks", 0),
         )

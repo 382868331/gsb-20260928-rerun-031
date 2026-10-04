@@ -38,26 +38,76 @@ class MaterialSource(MaterialProvider):
     def __init__(self, name: str = "source") -> None:
         self.name = name
         self._next_number = 1
+        self._planned: list[str] = []
+        self._plan_mode = False
+        self._cached: Optional[Material] = None
+        self.released_by_type: dict[str, int] = {}
+        self._released = 0
+
+    def plan_release(self, material_type: str, count: int = 1) -> None:
+        if count < 1:
+            raise ValueError("release count must be positive")
+        self._plan_mode = True
+        self._planned.extend([material_type] * count)
+
+    def _next_type(self) -> Optional[str]:
+        if self._planned:
+            return self._planned[0]
+        if not self._plan_mode:
+            return "standard"
+        return None
+
+    def peek(self) -> Optional[Material]:
+        material_type = self._next_type()
+        if material_type is None:
+            return None
+        if self._cached is None:
+            serial = f"M-{self._next_number:04d}"
+            self._next_number += 1
+            self._cached = Material(serial, MaterialState.IN_PROCESS, self.name, material_type)
+        return self._cached
 
     def can_take(self) -> bool:
-        return True
+        return self.peek() is not None
 
     def take(self) -> Material:
-        serial = f"M-{self._next_number:04d}"
-        self._next_number += 1
-        return Material(serial, MaterialState.IN_PROCESS, self.name)
+        material = self.peek()
+        if material is None:
+            raise RuntimeError(f"{self.name} is exhausted")
+        self._cached = None
+        if self._planned:
+            self._planned.pop(0)
+        self._released += 1
+        self.released_by_type[material.material_type] = (
+            self.released_by_type.get(material.material_type, 0) + 1
+        )
+        return material
 
     @property
     def released(self) -> int:
-        return self._next_number - 1
+        return self._released
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "next_number": self._next_number}
+        return {
+            "name": self.name,
+            "next_number": self._next_number,
+            "planned": list(self._planned),
+            "plan_mode": self._plan_mode,
+            "cached": self._cached.to_dict() if self._cached else None,
+            "released_by_type": dict(self.released_by_type),
+            "released": self._released,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MaterialSource":
         source = cls(data["name"])
         source._next_number = data["next_number"]
+        source._planned = list(data.get("planned", []))
+        source._plan_mode = data.get("plan_mode", bool(source._planned))
+        cached = data.get("cached")
+        source._cached = Material.from_dict(cached) if cached else None
+        source.released_by_type = dict(data.get("released_by_type", {}))
+        source._released = data.get("released", source._next_number - 1)
         return source
 
 
@@ -74,6 +124,9 @@ class Buffer(MaterialProvider, MaterialReceiver):
 
     def can_take(self) -> bool:
         return bool(self.items)
+
+    def peek(self) -> Optional[Material]:
+        return self.items[0] if self.items else None
 
     def receive(self, material: Material) -> None:
         if not self.can_accept():
@@ -134,6 +187,7 @@ class Station:
         self.material: Optional[Material] = None
         self.remaining_time: Optional[float] = None
         self.completion_event: Optional[int] = None
+        self.last_type: Optional[str] = None
 
     @property
     def is_idle(self) -> bool:
@@ -144,18 +198,36 @@ class Station:
         upstream: MaterialProvider,
         now: float,
         schedule_event: Callable[..., int],
+        cycle_time: Optional[float] = None,
+        setup_time: float = 0.0,
     ) -> None:
         material = upstream.take()
-        material.state = MaterialState.IN_PROCESS
+        visit = material.visits.get(self.name, 0) + 1
+        material.visits[self.name] = visit
+        cycle = self.cycle_time if cycle_time is None else float(cycle_time)
+        if setup_time > 0:
+            material.record(
+                now, self.name, visit, "setup",
+                duration=setup_time, material_type=material.material_type,
+            )
+            material.state = MaterialState.SETUP
+        else:
+            material.state = MaterialState.IN_PROCESS
+        material.record(
+            now, self.name, visit, "start",
+            cycle_time=cycle, setup_time=setup_time,
+            material_type=material.material_type,
+        )
         material.location = self.name
         self.material = material
-        self.remaining_time = self.cycle_time
+        self.remaining_time = setup_time + cycle
         self.state = DeviceState.PROCESSING
+        self.last_type = material.material_type
         self.completion_event = schedule_event(
-            now + self.cycle_time,
+            now + setup_time + cycle,
             "PROCESS_COMPLETE",
             self.name,
-            {"material": material.serial_number},
+            {"material": material.serial_number, "visit": visit},
         )
 
     def complete(self) -> None:
@@ -227,6 +299,7 @@ class Station:
             "material": self.material.to_dict() if self.material else None,
             "remaining_time": self.remaining_time,
             "completion_event": self.completion_event,
+            "last_type": self.last_type,
         }
 
     @classmethod
@@ -236,4 +309,5 @@ class Station:
         station.material = Material.from_dict(data["material"]) if data["material"] else None
         station.remaining_time = data["remaining_time"]
         station.completion_event = data["completion_event"]
+        station.last_type = data.get("last_type")
         return station

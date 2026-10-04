@@ -9,11 +9,22 @@
 - `MaterialSource` 与 `Sink`：分别负责投放和接收物料。
 - `EventQueue`：按仿真时间维护加工完成、故障、修复事件，事件会随快照保存。
 - `AssemblyLine`：串联设备，传播堵塞、故障恢复和物料台账。
+- `MaterialType`：一类物料的工艺定义，包含路线（途经工位）、各工位节拍、换型准备时间、抽检工位与返工上限。
+
+## 多类型物料
+
+- 通过构造参数 `material_types` 与 `release_plan` 按类型投放，仍走原有 source → 工位 → 缓冲 → sink 路径与同一本台账。
+- 换型时工位先执行准备（setup），不同节拍按类型生效；不在路线内的工位零时间穿过。
+- 抽检工位加工完成后物料进入 `pending_inspection` 并真实占用工位，结果送达前后续物料无法穿过。
+- `schedule_inspection_result` / `deliver_inspection_result` 送达 pass / rework / fail；迟到、重复、更正的结果按原物料与原检测轮次幂等忽略并记入 `inspection_log`。
+- 返工在同一物料身份上累加 `rework_count`，达到 `max_reworks` 后报废并保留原因与全部加工历史。
+- `reconcile_by_type()` 按类型核对投入、在制、完成、报废；`material_history(serial)` 追溯单件轨迹。
 
 ## 运行
 
 ```bash
 python demo.py
+python demo_multi_type.py
 python -m unittest discover -s tests -v
 ```
 

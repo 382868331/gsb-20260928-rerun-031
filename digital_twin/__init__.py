@@ -3,7 +3,7 @@
 from .devices import Buffer, MaterialSource, Sink, Station
 from .engine import Event, SimulationClock
 from .line import AssemblyLine
-from .material import Material, MaterialState
+from .material import Material, MaterialState, MaterialType
 
 __all__ = [
     "AssemblyLine",
@@ -12,6 +12,7 @@ __all__ = [
     "Material",
     "MaterialSource",
     "MaterialState",
+    "MaterialType",
     "SimulationClock",
     "Sink",
     "Station",
