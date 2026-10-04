@@ -35,29 +35,58 @@ class MaterialReceiver(ABC):
 
 
 class MaterialSource(MaterialProvider):
-    def __init__(self, name: str = "source") -> None:
+    def __init__(
+        self,
+        name: str = "source",
+        material_types: list[str] | None = None,
+        release_limit: int | None = None,
+    ) -> None:
         self.name = name
         self._next_number = 1
+        self.material_types = list(material_types) if material_types else ["standard"]
+        self.release_limit = release_limit
+        self.released_by_type: dict[str, int] = {}
 
     def can_take(self) -> bool:
-        return True
+        return self.release_limit is None or self.released < self.release_limit
 
     def take(self) -> Material:
+        if not self.can_take():
+            raise RuntimeError("source release limit reached")
         serial = f"M-{self._next_number:04d}"
+        material_type = self.material_types[(self._next_number - 1) % len(self.material_types)]
         self._next_number += 1
-        return Material(serial, MaterialState.IN_PROCESS, self.name)
+        self.released_by_type[material_type] = self.released_by_type.get(material_type, 0) + 1
+        material = Material(
+            serial_number=serial,
+            material_type=material_type,
+            state=MaterialState.IN_PROCESS,
+            location=self.name,
+        )
+        return material
 
     @property
     def released(self) -> int:
         return self._next_number - 1
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "next_number": self._next_number}
+        return {
+            "name": self.name,
+            "next_number": self._next_number,
+            "material_types": self.material_types,
+            "release_limit": self.release_limit,
+            "released_by_type": self.released_by_type,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MaterialSource":
-        source = cls(data["name"])
+        source = cls(
+            data["name"],
+            data.get("material_types"),
+            data.get("release_limit"),
+        )
         source._next_number = data["next_number"]
+        source.released_by_type = dict(data.get("released_by_type", {}))
         return source
 
 
@@ -105,6 +134,7 @@ class Sink(MaterialReceiver):
     def __init__(self, name: str = "sink") -> None:
         self.name = name
         self.accepted = 0
+        self.accepted_by_type: dict[str, int] = {}
 
     def can_accept(self) -> bool:
         return True
@@ -113,14 +143,21 @@ class Sink(MaterialReceiver):
         material.state = MaterialState.COMPLETED
         material.location = self.name
         self.accepted += 1
+        material_type = material.material_type
+        self.accepted_by_type[material_type] = self.accepted_by_type.get(material_type, 0) + 1
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "accepted": self.accepted}
+        return {
+            "name": self.name,
+            "accepted": self.accepted,
+            "accepted_by_type": self.accepted_by_type,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Sink":
         sink = cls(data["name"])
         sink.accepted = data["accepted"]
+        sink.accepted_by_type = dict(data.get("accepted_by_type", {}))
         return sink
 
 
@@ -134,6 +171,8 @@ class Station:
         self.material: Optional[Material] = None
         self.remaining_time: Optional[float] = None
         self.completion_event: Optional[int] = None
+        self.setup_event: Optional[int] = None
+        self.awaiting_inspection: bool = False
 
     @property
     def is_idle(self) -> bool:
@@ -141,21 +180,50 @@ class Station:
 
     def start(
         self,
-        upstream: MaterialProvider,
+        material: Material,
         now: float,
         schedule_event: Callable[..., int],
+        setup_time: float = 0.0,
     ) -> None:
-        material = upstream.take()
-        material.state = MaterialState.IN_PROCESS
         material.location = self.name
         self.material = material
-        self.remaining_time = self.cycle_time
         self.state = DeviceState.PROCESSING
+        if setup_time > 0:
+            material.state = MaterialState.SETUP
+            self.remaining_time = setup_time + self.cycle_time
+            self.setup_event = schedule_event(
+                now + setup_time,
+                "SETUP_COMPLETE",
+                self.name,
+                {"material": material.serial_number},
+            )
+            return
+        material.state = MaterialState.IN_PROCESS
+        self.remaining_time = self.cycle_time
         self.completion_event = schedule_event(
             now + self.cycle_time,
             "PROCESS_COMPLETE",
             self.name,
             {"material": material.serial_number},
+        )
+
+    def start_transit(self, material: Material) -> None:
+        material.state = MaterialState.IN_TRANSIT
+        material.location = self.name
+        self.material = material
+        self.remaining_time = 0.0
+        self.state = DeviceState.BLOCKED
+
+    def setup_complete(self, now: float, schedule_event: Callable[..., int]) -> None:
+        self.setup_event = None
+        if self.material is not None:
+            self.material.state = MaterialState.IN_PROCESS
+        self.remaining_time = self.cycle_time
+        self.completion_event = schedule_event(
+            now + self.cycle_time,
+            "PROCESS_COMPLETE",
+            self.name,
+            {"material": self.material.serial_number if self.material else None},
         )
 
     def complete(self) -> None:
@@ -175,6 +243,9 @@ class Station:
             self.completion_event = None
             if completion_time is not None:
                 self.remaining_time = max(0.0, completion_time - now)
+        if self.setup_event is not None:
+            cancel_event(self.setup_event)
+            self.setup_event = None
         scrapped = None
         if scrap_current and self.material is not None:
             scrapped = self.material
@@ -182,6 +253,7 @@ class Station:
             scrapped.location = "scrap"
             self.material = None
             self.remaining_time = None
+        self.awaiting_inspection = False
         self.state = DeviceState.DOWN
         return scrapped
 
@@ -209,6 +281,8 @@ class Station:
     def try_release(self, downstream: MaterialReceiver) -> bool:
         if self.material is None or self.state == DeviceState.DOWN:
             return False
+        if self.awaiting_inspection:
+            return False
         if not downstream.can_accept():
             self.state = DeviceState.BLOCKED
             return False
@@ -227,6 +301,8 @@ class Station:
             "material": self.material.to_dict() if self.material else None,
             "remaining_time": self.remaining_time,
             "completion_event": self.completion_event,
+            "setup_event": self.setup_event,
+            "awaiting_inspection": self.awaiting_inspection,
         }
 
     @classmethod
@@ -236,4 +312,6 @@ class Station:
         station.material = Material.from_dict(data["material"]) if data["material"] else None
         station.remaining_time = data["remaining_time"]
         station.completion_event = data["completion_event"]
+        station.setup_event = data.get("setup_event")
+        station.awaiting_inspection = data.get("awaiting_inspection", False)
         return station

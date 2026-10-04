@@ -35,3 +35,15 @@ assert resumed.accounts_balanced()
 ```text
 已投物料 = 已产出 + 在制 + 已报废
 ```
+
+## 多类型物料
+
+`AssemblyLine` 的可选参数把多类型物料接入同一条投料路径：
+
+- `material_types` / `release_limit`：源头按顺序轮替投放不同类型，可限制投放总数。
+- `routes`：每种类型的工位路线；不在路线上的工位按 transit 直通，仍占用工位。
+- `setup_times`：工位加工前的准备时间（SETUP_COMPLETE 事件）。
+- `inspection_stations`：加工完成后进入 pending_inspection，物料真实占用工位，后续物料无法穿过；`deliver_inspection` 按 物料@工位#轮次 送达结果，重复或迟到的结果被忽略并记录，未应用前的结果可被更正。
+- `max_reworks`：返工在同一物料身份上追加历史；达到上限后报废并保留原因。
+
+运行 `python demo_multi_type.py` 查看多类型演示。快照会保存待检状态、处置记录与物料历史，恢复后轨迹与不中断运行一致。
