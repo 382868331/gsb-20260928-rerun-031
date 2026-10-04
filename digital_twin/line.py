@@ -237,53 +237,91 @@ class AssemblyLine:
         serial_number: str,
         station_name: str,
         result: str,
+        visit: int,
     ) -> int:
+        self._validate_inspection_result(result, visit)
         return self._schedule(
             time,
             "INSPECTION_RESULT",
             station_name,
-            {"serial": serial_number, "result": result},
+            {"serial": serial_number, "result": result, "visit": visit},
         )
 
-    def deliver_inspection_result(self, serial_number: str, station_name: str, result: str) -> None:
+    def deliver_inspection_result(
+        self,
+        serial_number: str,
+        station_name: str,
+        result: str,
+        visit: int,
+    ) -> None:
+        self._validate_inspection_result(result, visit)
         event = Event(
             uid=0,
             time=self.clock.time,
             kind="INSPECTION_RESULT",
             source=station_name,
-            payload={"serial": serial_number, "result": result},
+            payload={"serial": serial_number, "result": result, "visit": visit},
         )
         self._handle_inspection_result(event)
         self._refresh()
 
-    def _find_disposition(self, serial: str, station: str) -> DispositionRecord | None:
-        matches = [
-            record
-            for key, record in self.dispositions.items()
-            if key.startswith(f"{serial}|{station}|")
-        ]
-        return matches[-1] if matches else None
+    @staticmethod
+    def _validate_inspection_result(result: str, visit: int) -> None:
+        if result not in ("pass", "rework", "fail", "scrap"):
+            raise ValueError(f"unknown inspection result: {result}")
+        if not isinstance(visit, int) or isinstance(visit, bool) or visit < 1:
+            raise ValueError("inspection visit must be a positive integer")
+
+    def _record_unapplied_inspection(
+        self,
+        event: Event,
+        serial: str,
+        action: str,
+        reason: str,
+        expected_key: str | None,
+        received_key: str | None,
+    ) -> None:
+        self.inspection_log.append(
+            {
+                "time": event.time,
+                "serial_number": serial,
+                "station": event.source,
+                "result": event.payload["result"],
+                "visit": event.payload.get("visit"),
+                "action": action,
+                "reason": reason,
+                "expected_key": expected_key,
+                "received_key": received_key,
+            }
+        )
 
     def _handle_inspection_result(self, event: Event) -> None:
         serial = event.payload["serial"]
         result = event.payload["result"]
         if result not in ("pass", "rework", "fail", "scrap"):
             raise ValueError(f"unknown inspection result: {result}")
-        key = self.pending_inspections.get(serial)
-        if key is None or not key.startswith(f"{serial}|{event.source}|"):
-            original = self._find_disposition(serial, event.source)
-            self.inspection_log.append(
-                {
-                    "time": event.time,
-                    "serial_number": serial,
-                    "station": event.source,
-                    "result": result,
-                    "action": "ignored",
-                    "reason": "no pending inspection for this round",
-                    "original_key": original.key if original else None,
-                }
+        expected_key = self.pending_inspections.get(serial)
+        visit = event.payload.get("visit")
+        if not isinstance(visit, int) or isinstance(visit, bool) or visit < 1:
+            self._record_unapplied_inspection(
+                event, serial, "held", "missing inspection visit",
+                expected_key, None,
             )
             return
+        received_key = self._inspection_key(serial, event.source, visit)
+        if expected_key != received_key:
+            existing = self.dispositions.get(received_key)
+            if existing is not None and existing.result == result:
+                action, reason = "ignored", "duplicate inspection result"
+            elif expected_key is not None:
+                action, reason = "held", "result does not belong to current inspection"
+            else:
+                action, reason = "ignored", "no current inspection with this identity"
+            self._record_unapplied_inspection(
+                event, serial, action, reason, expected_key, received_key,
+            )
+            return
+        key = received_key
         index = self._station_index(event.source)
         station = self.stations[index]
         material = station.material

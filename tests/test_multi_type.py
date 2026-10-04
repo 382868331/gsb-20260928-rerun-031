@@ -30,11 +30,21 @@ def build_line() -> AssemblyLine:
 
 
 def schedule_results(line: AssemblyLine) -> None:
-    line.schedule_inspection_result(10, "M-0001", "station-2", "pass")
-    line.schedule_inspection_result(11, "M-0001", "station-2", "pass")
-    line.schedule_inspection_result(15, "M-0002", "station-2", "rework")
-    line.schedule_inspection_result(16, "M-0002", "station-2", "pass")
-    line.schedule_inspection_result(20, "M-0002", "station-2", "rework")
+    line.schedule_inspection_result(10, "M-0001", "station-2", "pass", 1)
+    line.schedule_inspection_result(11, "M-0001", "station-2", "pass", 1)
+    line.schedule_inspection_result(15, "M-0002", "station-2", "rework", 1)
+    line.schedule_inspection_result(16, "M-0002", "station-2", "pass", 1)
+    line.schedule_inspection_result(20, "M-0002", "station-2", "rework", 2)
+
+
+def schedule_late_round_results(line: AssemblyLine) -> None:
+    line.schedule_inspection_result(10, "M-0001", "station-2", "pass", 1)
+    line.schedule_inspection_result(10.1, "M-0001", "station-2", "pass", 1)
+    line.schedule_inspection_result(15, "M-0002", "station-2", "rework", 1)
+    line.schedule_inspection_result(19.1, "M-0002", "station-2", "pass", 1)
+    line.schedule_inspection_result(19.2, "M-0002", "station-2", "fail", 1)
+    line.schedule_inspection_result(19.5, "M-0002", "station-2", "pass", 2)
+    line.schedule_inspection_result(19.6, "M-0002", "station-2", "pass", 2)
 
 
 class MultiTypeLineTest(unittest.TestCase):
@@ -94,10 +104,78 @@ class MultiTypeLineTest(unittest.TestCase):
         self.assertEqual(ignored, {("M-0001", "pass"), ("M-0002", "pass")})
         for entry in line.inspection_log:
             self.assertEqual(entry["action"], "ignored")
-            self.assertIsNotNone(entry["original_key"])
+            self.assertEqual(entry["received_key"], f"{entry['serial_number']}|station-2|{entry['visit']}")
         self.assertEqual(len(line.dispositions), 3)
         self.assertEqual(line.completed, 2)
         self.assertEqual(line.scrapped, 1)
+
+    def test_only_current_round_identity_can_release_station(self) -> None:
+        line = build_line()
+        schedule_late_round_results(line)
+        line.run_until(19.2)
+
+        station2 = line.stations[1]
+        self.assertIsNotNone(station2.material)
+        self.assertEqual(station2.material.serial_number, "M-0002")
+        self.assertEqual(station2.material.state.value, "pending_inspection")
+        self.assertEqual(line.pending_inspections, {"M-0002": "M-0002|station-2|2"})
+        self.assertEqual(station2.material.rework_count, 1)
+
+        held = line.inspection_log[-2:]
+        self.assertEqual([(entry["visit"], entry["action"]) for entry in held], [(1, "held"), (1, "held")])
+        self.assertTrue(all(entry["expected_key"] == "M-0002|station-2|2" for entry in held))
+
+        line.run_until(23)
+        self.assertEqual(line.completed, 3)
+        self.assertEqual(line.scrapped, 0)
+        self.assertTrue(line.accounts_balanced())
+        duplicate = line.inspection_log[-1]
+        self.assertEqual((duplicate["serial_number"], duplicate["visit"], duplicate["action"]), ("M-0002", 2, "ignored"))
+
+    def test_late_round_results_remain_held_after_save_and_resume(self) -> None:
+        reference = build_line()
+        schedule_late_round_results(reference)
+        reference.run_until(23)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending-round.json"
+            paused = build_line()
+            schedule_late_round_results(paused)
+            paused.pause_at(19.2)
+            paused.save(path)
+
+            resumed = AssemblyLine.load(path)
+            self.assertEqual(resumed.stations[1].material.serial_number, "M-0002")
+            self.assertEqual(resumed.pending_inspections, {"M-0002": "M-0002|station-2|2"})
+            resumed.run_until(23)
+
+        self.assertEqual(resumed.status(), reference.status())
+        self.assertEqual(resumed.ledger, reference.ledger)
+        self.assertEqual(resumed.inspection_log, reference.inspection_log)
+        self.assertEqual(resumed.scraps, reference.scraps)
+        self.assertEqual(resumed.reconcile_by_type(), reference.reconcile_by_type())
+        for serial in ("M-0001", "M-0002", "M-0003"):
+            self.assertEqual(resumed.material_history(serial), reference.material_history(serial))
+
+    def test_late_round_pass_cannot_bypass_rework_limit(self) -> None:
+        line = build_line()
+        line.schedule_inspection_result(10, "M-0001", "station-2", "pass", 1)
+        line.schedule_inspection_result(15, "M-0002", "station-2", "rework", 1)
+        line.run_until(19)
+
+        self.assertEqual(line.pending_inspections, {"M-0002": "M-0002|station-2|2"})
+        line.deliver_inspection_result("M-0002", "station-2", "pass", 1)
+        line.deliver_inspection_result("M-0002", "station-2", "fail", 1)
+        line.deliver_inspection_result("M-0002", "station-2", "rework", 2)
+
+        self.assertEqual(line.scrapped, 1)
+        self.assertEqual(line.scraps[0]["reason"], "rework_limit_exceeded")
+        self.assertEqual(line.scraps[0]["rework_count"], 1)
+        self.assertEqual(line.pending_inspections, {})
+        self.assertTrue(all(entry["action"] == "held" for entry in line.inspection_log))
+        line.run_until(24)
+        self.assertEqual(line.completed, 2)
+        self.assertTrue(line.accounts_balanced())
 
     def test_save_resume_with_pending_inspection_matches_uninterrupted(self) -> None:
         reference = build_line()
@@ -114,7 +192,7 @@ class MultiTypeLineTest(unittest.TestCase):
 
             resumed = AssemblyLine.load(path)
             resumed.run_until(10.5)
-            resumed.deliver_inspection_result("M-0001", "station-2", "pass")
+            resumed.deliver_inspection_result("M-0001", "station-2", "pass", 1)
             resumed.run_until(30)
 
         self.assertEqual(resumed.status(), reference.status())

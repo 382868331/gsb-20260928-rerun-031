@@ -34,11 +34,11 @@ def build_line() -> AssemblyLine:
 
 
 def schedule_results(line: AssemblyLine) -> None:
-    line.schedule_inspection_result(10, "M-0001", "station-2", "pass")
-    line.schedule_inspection_result(11, "M-0001", "station-2", "pass")  # duplicate, ignored
-    line.schedule_inspection_result(15, "M-0002", "station-2", "rework")
-    line.schedule_inspection_result(16, "M-0002", "station-2", "pass")  # late, ignored
-    line.schedule_inspection_result(20, "M-0002", "station-2", "rework")  # over limit, scrap
+    line.schedule_inspection_result(10, "M-0001", "station-2", "pass", 1)
+    line.schedule_inspection_result(11, "M-0001", "station-2", "pass", 1)  # duplicate, ignored
+    line.schedule_inspection_result(15, "M-0002", "station-2", "rework", 1)
+    line.schedule_inspection_result(16, "M-0002", "station-2", "pass", 1)  # late, ignored
+    line.schedule_inspection_result(20, "M-0002", "station-2", "rework", 2)  # over limit, scrap
 
 
 def print_status(title: str, line: AssemblyLine) -> None:
@@ -56,7 +56,7 @@ def main() -> None:
 
     resumed = AssemblyLine.load(STATE_PATH)
     resumed.run_until(10.5)
-    resumed.deliver_inspection_result("M-0001", "station-2", "pass")  # duplicate, ignored
+    resumed.deliver_inspection_result("M-0001", "station-2", "pass", 1)  # duplicate, ignored
     resumed.run_until(30)
     print_status("finished: rework limit scrapped M-0002, others completed", resumed)
 
