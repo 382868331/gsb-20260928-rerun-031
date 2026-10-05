@@ -44,6 +44,7 @@ class AssemblyLine:
         self.pending_inspections: dict[str, str] = {}
         self.dispositions: dict[str, DispositionRecord] = {}
         self.inspection_log: list[dict] = []
+        self.indeterminate_results: list[dict] = []
         self.scraps: list[dict] = []
         self.scrap_materials: list[Material] = []
         self.completed_materials: list[Material] = []
@@ -237,66 +238,132 @@ class AssemblyLine:
         serial_number: str,
         station_name: str,
         result: str,
+        visit: int | None = None,
     ) -> int:
         return self._schedule(
             time,
             "INSPECTION_RESULT",
             station_name,
-            {"serial": serial_number, "result": result},
+            {"serial": serial_number, "result": result, "visit": visit},
         )
 
-    def deliver_inspection_result(self, serial_number: str, station_name: str, result: str) -> None:
+    def deliver_inspection_result(
+        self,
+        serial_number: str,
+        station_name: str,
+        result: str,
+        visit: int | None = None,
+    ) -> None:
         event = Event(
             uid=0,
             time=self.clock.time,
             kind="INSPECTION_RESULT",
             source=station_name,
-            payload={"serial": serial_number, "result": result},
+            payload={"serial": serial_number, "result": result, "visit": visit},
         )
         self._handle_inspection_result(event)
         self._refresh()
 
-    def _find_disposition(self, serial: str, station: str) -> DispositionRecord | None:
-        matches = [
-            record
-            for key, record in self.dispositions.items()
-            if key.startswith(f"{serial}|{station}|")
-        ]
-        return matches[-1] if matches else None
+    def _log_ignored(
+        self, event: Event, key: str | None, reason: str,
+        claimed_key: str | None = None,
+    ) -> None:
+        self.inspection_log.append(
+            {
+                "time": event.time,
+                "serial_number": event.payload["serial"],
+                "station": event.source,
+                "visit": event.payload.get("visit"),
+                "result": event.payload["result"],
+                "action": "ignored",
+                "reason": reason,
+                "original_key": key,
+                "claimed_key": claimed_key,
+            }
+        )
+
+    def _hold_indeterminate(self, event: Event, claimed_key: str | None, reason: str) -> None:
+        entry = {
+            "time": event.time,
+            "serial_number": event.payload["serial"],
+            "station": event.source,
+            "visit": event.payload.get("visit"),
+            "result": event.payload["result"],
+            "action": "indeterminate",
+            "reason": reason,
+            "claimed_key": claimed_key,
+        }
+        self.indeterminate_results.append(entry)
+        self.inspection_log.append(dict(entry))
 
     def _handle_inspection_result(self, event: Event) -> None:
         serial = event.payload["serial"]
         result = event.payload["result"]
+        visit = event.payload.get("visit")
         if result not in ("pass", "rework", "fail", "scrap"):
             raise ValueError(f"unknown inspection result: {result}")
-        key = self.pending_inspections.get(serial)
-        if key is None or not key.startswith(f"{serial}|{event.source}|"):
-            original = self._find_disposition(serial, event.source)
-            self.inspection_log.append(
-                {
-                    "time": event.time,
-                    "serial_number": serial,
-                    "station": event.source,
-                    "result": result,
-                    "action": "ignored",
-                    "reason": "no pending inspection for this round",
-                    "original_key": original.key if original else None,
-                }
+        station_name = event.source
+        current_key = self.pending_inspections.get(serial)
+        claimed_key = (
+            self._inspection_key(serial, station_name, visit)
+            if visit is not None
+            else None
+        )
+
+        if visit is None:
+            latest = [
+                record
+                for key, record in self.dispositions.items()
+                if key.startswith(f"{serial}|{station_name}|")
+            ]
+            if latest:
+                self._log_ignored(
+                    event, latest[-1].key,
+                    "result without inspection round after round finalized", None,
+                )
+                return
+            self._hold_indeterminate(
+                event, None,
+                "result carries no inspection round; round cannot be verified",
             )
             return
-        index = self._station_index(event.source)
+
+        if current_key != claimed_key:
+            if claimed_key in self.dispositions:
+                self._log_ignored(
+                    event, self.dispositions[claimed_key].key,
+                    "round already finalized", claimed_key,
+                )
+            else:
+                self._hold_indeterminate(
+                    event, claimed_key,
+                    "claimed round is not the current pending inspection",
+                )
+            return
+        if claimed_key in self.dispositions:
+            self._log_ignored(
+                event, self.dispositions[claimed_key].key,
+                "round already finalized", claimed_key,
+            )
+            return
+
+        index = self._station_index(station_name)
         station = self.stations[index]
         material = station.material
         if material is None or material.serial_number != serial:
-            raise RuntimeError(f"pending material {serial} not found at {station.name}")
+            self._hold_indeterminate(
+                event, claimed_key,
+                f"material does not occupy {station.name}",
+            )
+            return
         del self.pending_inspections[serial]
         material_type = self._type_of(material)
         visit = material.visits.get(station.name, 0)
-        record = DispositionRecord(key, event.time, station.name, visit, result)
-        self.dispositions[key] = record
+        record = DispositionRecord(claimed_key, event.time, station.name, visit, result)
+        self.dispositions[claimed_key] = record
         if result == "pass":
             record.rework_count_after = material.rework_count
-            material.record(event.time, station.name, visit, "inspection_pass", key=key)
+            material.record(event.time, station.name, visit, "inspection_pass", key=claimed_key)
             material.state = MaterialState.IN_PROCESS
             self.ledger[serial] = MaterialState.IN_PROCESS.value
         elif result == "rework" and material.rework_count < material_type.max_reworks:
@@ -306,7 +373,7 @@ class AssemblyLine:
             material.visits[station.name] = visit
             material.record(
                 event.time, station.name, visit, "rework_start",
-                key=key, rework_count=material.rework_count,
+                key=claimed_key, rework_count=material.rework_count,
             )
             material.state = MaterialState.IN_PROCESS
             cycle = material_type.cycle_time_for(station.name, station.cycle_time)
@@ -397,6 +464,7 @@ class AssemblyLine:
             for key, item in data.get("dispositions", {}).items()
         }
         line.inspection_log = list(data.get("inspection_log", []))
+        line.indeterminate_results = list(data.get("indeterminate_results", []))
         line.scraps = list(data.get("scraps", []))
         line.scrap_materials = [
             Material.from_dict(item) for item in data.get("scrap_materials", [])
@@ -427,6 +495,7 @@ class AssemblyLine:
                 key: record.to_dict() for key, record in self.dispositions.items()
             },
             "inspection_log": list(self.inspection_log),
+            "indeterminate_results": list(self.indeterminate_results),
             "scraps": list(self.scraps),
             "scrap_materials": [material.to_dict() for material in self.scrap_materials],
             "completed_materials": [material.to_dict() for material in self.completed_materials],

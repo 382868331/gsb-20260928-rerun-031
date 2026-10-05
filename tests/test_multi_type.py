@@ -30,11 +30,11 @@ def build_line() -> AssemblyLine:
 
 
 def schedule_results(line: AssemblyLine) -> None:
-    line.schedule_inspection_result(10, "M-0001", "station-2", "pass")
-    line.schedule_inspection_result(11, "M-0001", "station-2", "pass")
-    line.schedule_inspection_result(15, "M-0002", "station-2", "rework")
-    line.schedule_inspection_result(16, "M-0002", "station-2", "pass")
-    line.schedule_inspection_result(20, "M-0002", "station-2", "rework")
+    line.schedule_inspection_result(10, "M-0001", "station-2", "pass", visit=1)
+    line.schedule_inspection_result(11, "M-0001", "station-2", "pass", visit=1)
+    line.schedule_inspection_result(15, "M-0002", "station-2", "rework", visit=1)
+    line.schedule_inspection_result(16, "M-0002", "station-2", "pass", visit=1)
+    line.schedule_inspection_result(20, "M-0002", "station-2", "rework", visit=2)
 
 
 class MultiTypeLineTest(unittest.TestCase):
@@ -114,7 +114,7 @@ class MultiTypeLineTest(unittest.TestCase):
 
             resumed = AssemblyLine.load(path)
             resumed.run_until(10.5)
-            resumed.deliver_inspection_result("M-0001", "station-2", "pass")
+            resumed.deliver_inspection_result("M-0001", "station-2", "pass", visit=1)
             resumed.run_until(30)
 
         self.assertEqual(resumed.status(), reference.status())

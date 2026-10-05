@@ -16,7 +16,9 @@
 - 通过构造参数 `material_types` 与 `release_plan` 按类型投放，仍走原有 source → 工位 → 缓冲 → sink 路径与同一本台账。
 - 换型时工位先执行准备（setup），不同节拍按类型生效；不在路线内的工位零时间穿过。
 - 抽检工位加工完成后物料进入 `pending_inspection` 并真实占用工位，结果送达前后续物料无法穿过。
-- `schedule_inspection_result` / `deliver_inspection_result` 送达 pass / rework / fail；迟到、重复、更正的结果按原物料与原检测轮次幂等忽略并记入 `inspection_log`。
+- `schedule_inspection_result` / `deliver_inspection_result` 通过 `visit` 携带明确的检测轮次，送达 pass / rework / fail；核对物料、工位与当轮检测身份（`序列号|工位|轮次`），不能仅凭该物料当前存在待检记录就采用。
+- 当前待检轮次的重复结果按已定论轮次幂等忽略；已定论旧轮次的迟到、更正结果也幂等忽略，均记入 `inspection_log`，不会放行新一轮等待中的物料。
+- 无轮次、轮次与当前待检不符、或与工位实际占用物料对不上的结果保留待定，记入 `indeterminate_results`，不会自动套用到最新一轮；待判定结果随快照保存。
 - 返工在同一物料身份上累加 `rework_count`，达到 `max_reworks` 后报废并保留原因与全部加工历史。
 - `reconcile_by_type()` 按类型核对投入、在制、完成、报废；`material_history(serial)` 追溯单件轨迹。
 
