@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .devices import Buffer, DeviceState, MaterialReceiver, MaterialSource, Sink, Station
 from .engine import Event, EventQueue, SimulationClock
+from .inspection import InspectionJob, InspectionResource
 from .material import DispositionRecord, Material, MaterialState, MaterialType
 
 
@@ -16,6 +17,10 @@ class AssemblyLine:
         initial_time: float = 0.0,
         material_types: list[MaterialType] | None = None,
         release_plan: dict[str, int] | None = None,
+        inspection_capacity: int | None = None,
+        inspection_duration: float = 1.0,
+        inspection_outages: list[tuple[float, float]] | None = None,
+        inspection_policy: str = "priority",
     ) -> None:
         if len(station_cycle_times) < 1:
             raise ValueError("at least one station is required")
@@ -50,9 +55,25 @@ class AssemblyLine:
         self.completed_materials: list[Material] = []
         self.completed_by_type: dict[str, int] = {}
         self.scrapped_by_type: dict[str, int] = {}
+        self.inspection_duration = float(inspection_duration)
+        self.inspection_resource: InspectionResource | None = None
+        if inspection_capacity is not None:
+            self.inspection_resource = InspectionResource(
+                "inspection-1", inspection_capacity, inspection_policy,
+            )
+            for start, end in inspection_outages or []:
+                self.inspection_resource.add_outage(start, end)
+            for _, end in self.inspection_resource.outages:
+                self._schedule(end, "INSPECTION_WAKEUP", "inspection-1")
         for material_type, count in (release_plan or {}).items():
             self.release(material_type, count)
         self._refresh()
+
+    def add_inspection_outage(self, start: float, end: float) -> None:
+        if self.inspection_resource is None:
+            raise RuntimeError("inspection resource is not enabled")
+        self.inspection_resource.add_outage(start, end)
+        self._schedule(end, "INSPECTION_WAKEUP", self.inspection_resource.name)
 
     def register_material_type(self, material_type: MaterialType) -> None:
         station_names = {station.name for station in self.stations}
@@ -148,6 +169,32 @@ class AssemblyLine:
                     if station.material is not None:
                         self.ledger[station.material.serial_number] = MaterialState.IN_PROCESS.value
                     changed = True
+        self._maybe_start_inspections()
+
+    def _maybe_start_inspections(self) -> None:
+        resource = self.inspection_resource
+        if resource is None:
+            return
+        while True:
+            job = resource.start_next(self.clock.time)
+            if job is None:
+                return
+            material = self._material_by_serial(job.serial_number)
+            if material is not None:
+                material.record(
+                    self.clock.time, job.station, job.visit, "inspection_start",
+                    key=job.key, resource=resource.name,
+                )
+
+    def _material_by_serial(self, serial_number: str) -> Material | None:
+        for station in self.stations:
+            if station.material and station.material.serial_number == serial_number:
+                return station.material
+        for buffer in self.buffers:
+            for material in buffer.items:
+                if material.serial_number == serial_number:
+                    return material
+        return None
 
     def schedule_fault(
         self,
@@ -181,6 +228,8 @@ class AssemblyLine:
         if scrapped is not None:
             self.pending_inspections.pop(scrapped.serial_number, None)
             self._record_scrap(scrapped, event.time, event.source, "station_fault")
+            if self.inspection_resource is not None:
+                self.inspection_resource.cancel_for_serial(scrapped.serial_number, event.time)
         self._schedule(
             event.time + event.payload["duration"],
             "STATION_REPAIRED",
@@ -230,6 +279,19 @@ class AssemblyLine:
                 material.record(event.time, station.name, visit, "await_inspection", key=key)
                 self.pending_inspections[material.serial_number] = key
                 self.ledger[material.serial_number] = MaterialState.PENDING_INSPECTION.value
+                if self.inspection_resource is not None:
+                    self.inspection_resource.submit(
+                        InspectionJob(
+                            key=key,
+                            serial_number=material.serial_number,
+                            station=station.name,
+                            visit=visit,
+                            priority=material_type.priority,
+                            due_time=material_type.due_time,
+                            duration=self.inspection_duration,
+                            enqueue_time=event.time,
+                        )
+                    )
         self._refresh()
 
     def schedule_inspection_result(
@@ -263,6 +325,40 @@ class AssemblyLine:
         )
         self._handle_inspection_result(event)
         self._refresh()
+
+    def inspection_order(self) -> list[str]:
+        if self.inspection_resource is None:
+            return []
+        return self.inspection_resource.executable_order()
+
+    def inspection_metrics(self) -> dict:
+        if self.inspection_resource is None:
+            return {}
+        return self.inspection_resource.metrics()
+
+    def predict_inspection_result(
+        self,
+        serial_number: str,
+        station_name: str,
+        result: str,
+        visit: int,
+    ) -> bool:
+        """记录预测结果；预测不构成实际放行，不触碰处置与占用。"""
+        if self.inspection_resource is None:
+            return False
+        key = self._inspection_key(serial_number, station_name, visit)
+        return self.inspection_resource.predict(key, result)
+
+    def cancel_inspection(
+        self,
+        serial_number: str,
+        station_name: str,
+        visit: int,
+    ) -> str:
+        if self.inspection_resource is None:
+            return "inactive"
+        key = self._inspection_key(serial_number, station_name, visit)
+        return self.inspection_resource.cancel(key, self.clock.time)
 
     def _log_ignored(
         self, event: Event, key: str | None, reason: str,
@@ -309,6 +405,13 @@ class AssemblyLine:
             if visit is not None
             else None
         )
+        resource = self.inspection_resource
+        finished_cancel_pending = False
+        if resource is not None and claimed_key is not None:
+            pending_cancel = resource.jobs.get(claimed_key)
+            if pending_cancel is not None and pending_cancel.state == "cancel_pending":
+                resource.finish(claimed_key, event.time, result)
+                finished_cancel_pending = True
 
         if visit is None:
             latest = [
@@ -356,6 +459,22 @@ class AssemblyLine:
                 f"material does not occupy {station.name}",
             )
             return
+        if resource is not None:
+            job = resource.jobs.get(claimed_key)
+            if job is None or (not job.active and not finished_cancel_pending):
+                self._hold_indeterminate(
+                    event, claimed_key,
+                    "no active inspection commitment for this round",
+                )
+                return
+            if job.state == "queued":
+                self._hold_indeterminate(
+                    event, claimed_key,
+                    "inspection not started on resource",
+                )
+                return
+            if not finished_cancel_pending:
+                resource.finish(claimed_key, event.time, result)
         del self.pending_inspections[serial]
         material_type = self._type_of(material)
         visit = material.visits.get(station.name, 0)
@@ -394,6 +513,8 @@ class AssemblyLine:
             station.completion_event = None
             station.state = DeviceState.IDLE
             self._record_scrap(material, event.time, station.name, reason)
+            if resource is not None:
+                resource.cancel_for_serial(serial, event.time)
 
     def _process_next(self) -> Event:
         event = self.event_queue.pop()
@@ -408,6 +529,8 @@ class AssemblyLine:
             self._handle_repaired(event)
         elif event.kind == "INSPECTION_RESULT":
             self._handle_inspection_result(event)
+            self._refresh()
+        elif event.kind == "INSPECTION_WAKEUP":
             self._refresh()
         else:
             raise ValueError(f"unknown event kind: {event.kind}")
@@ -474,6 +597,11 @@ class AssemblyLine:
         ]
         line.completed_by_type = dict(data.get("completed_by_type", {}))
         line.scrapped_by_type = dict(data.get("scrapped_by_type", {}))
+        line.inspection_duration = data.get("inspection_duration", 1.0)
+        resource_data = data.get("inspection_resource")
+        line.inspection_resource = (
+            InspectionResource.from_dict(resource_data) if resource_data else None
+        )
         return line
 
     def to_dict(self) -> dict:
@@ -501,6 +629,12 @@ class AssemblyLine:
             "completed_materials": [material.to_dict() for material in self.completed_materials],
             "completed_by_type": dict(self.completed_by_type),
             "scrapped_by_type": dict(self.scrapped_by_type),
+            "inspection_duration": self.inspection_duration,
+            "inspection_resource": (
+                self.inspection_resource.to_dict()
+                if self.inspection_resource is not None
+                else None
+            ),
         }
 
     @property

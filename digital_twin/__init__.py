@@ -2,6 +2,7 @@
 
 from .devices import Buffer, MaterialSource, Sink, Station
 from .engine import Event, SimulationClock
+from .inspection import InspectionJob, InspectionResource
 from .line import AssemblyLine
 from .material import Material, MaterialState, MaterialType
 
@@ -9,6 +10,8 @@ __all__ = [
     "AssemblyLine",
     "Buffer",
     "Event",
+    "InspectionJob",
+    "InspectionResource",
     "Material",
     "MaterialSource",
     "MaterialState",

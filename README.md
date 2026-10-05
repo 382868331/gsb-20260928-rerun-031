@@ -22,6 +22,16 @@
 - 返工在同一物料身份上累加 `rework_count`，达到 `max_reworks` 后报废并保留原因与全部加工历史。
 - `reconcile_by_type()` 按类型核对投入、在制、完成、报废；`material_history(serial)` 追溯单件轨迹。
 
+## 检测资源受限时的返工调度
+
+- 构造参数 `inspection_capacity` 启用受限检测工位（`InspectionResource`），多个物料的不同访问轮次在同一资源上排队；`inspection_duration` 为检测估计时长，`inspection_policy` 可选 `priority`（默认）或 `fifo`。
+- `MaterialType` 新增 `priority`（交付优先级）与 `due_time`（交期）；`inspection_outages` 或 `add_inspection_outage(start, end)` 指定工位停用区间，停用期间不开始新检测，装不下的作业会让位给能装下的作业，停用结束自动唤醒。
+- `inspection_order()` 给出当前可执行顺序；`inspection_metrics()` 汇总总等待时间与逾期数量，便于比较不同调度策略；`InspectionResource.conserved()` 核对作业守恒（已提交 = 排队 + 在检 + 完成 + 取消）。
+- 检测必须先由资源实际开始：`predict_inspection_result` 只记录预测，不构成放行；未开始的轮次收到结果会保留待定；旧轮次反馈不会提前释放当前检测占用。
+- 实际失败（fail / 超返工上限 / 工位故障报废）只重排受影响的剩余路线：该物料尚未开始的检测承诺由 `cancel_for_serial` 释放，已开始的标记 `cancel_pending`，等待明确结束后才释放资源；已完成加工与已发生报废保持事实。
+- `cancel_inspection(serial, station, visit)` 手动取消：未开始返回 `released` 并释放承诺，已开始返回 `deferred`。
+- 检测资源状态（队列、停用区间、全部作业）随快照保存与恢复。
+
 ## 运行
 
 ```bash
