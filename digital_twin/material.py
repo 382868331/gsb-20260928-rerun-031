@@ -132,6 +132,9 @@ class MaterialType:
     setup_time: float = 0.0
     inspect_after: tuple = ()
     max_reworks: int = 0
+    priority: int = 0
+    due: float | None = None
+    inspection_time: float = 1.0
 
     def cycle_time_for(self, station_name: str, default: float) -> float:
         return float(self.cycle_times.get(station_name, default))
@@ -144,6 +147,9 @@ class MaterialType:
             "setup_time": self.setup_time,
             "inspect_after": list(self.inspect_after),
             "max_reworks": self.max_reworks,
+            "priority": self.priority,
+            "due": self.due,
+            "inspection_time": self.inspection_time,
         }
 
     @classmethod
@@ -155,4 +161,7 @@ class MaterialType:
             setup_time=data.get("setup_time", 0.0),
             inspect_after=tuple(data.get("inspect_after", ())),
             max_reworks=data.get("max_reworks", 0),
+            priority=data.get("priority", 0),
+            due=data.get("due"),
+            inspection_time=data.get("inspection_time", 1.0),
         )

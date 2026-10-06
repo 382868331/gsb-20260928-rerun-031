@@ -5,6 +5,15 @@ from pathlib import Path
 
 from .devices import Buffer, DeviceState, MaterialReceiver, MaterialSource, Sink, Station
 from .engine import Event, EventQueue, SimulationClock
+from .inspection import (
+    JOB_ACTIVE,
+    JOB_CANCELLED,
+    JOB_FINISHED,
+    JOB_QUEUED,
+    InspectionJob,
+    job_order_key,
+    plan_inspections,
+)
 from .material import DispositionRecord, Material, MaterialState, MaterialType
 
 
@@ -16,6 +25,8 @@ class AssemblyLine:
         initial_time: float = 0.0,
         material_types: list[MaterialType] | None = None,
         release_plan: dict[str, int] | None = None,
+        inspection_resources: dict[str, list[str]] | None = None,
+        inspection_capacity: int = 1,
     ) -> None:
         if len(station_cycle_times) < 1:
             raise ValueError("at least one station is required")
@@ -50,6 +61,17 @@ class AssemblyLine:
         self.completed_materials: list[Material] = []
         self.completed_by_type: dict[str, int] = {}
         self.scrapped_by_type: dict[str, int] = {}
+        if inspection_capacity < 1:
+            raise ValueError("inspection capacity must be positive")
+        self.inspection_capacity = inspection_capacity
+        self._station_to_resource: dict[str, str] = {}
+        for resource, stations in (inspection_resources or {}).items():
+            for station_name in stations:
+                self._station_index(station_name)
+                self._station_to_resource[station_name] = resource
+        self.inspection_outages: dict[str, list[list[float]]] = {}
+        self.inspection_jobs: dict[str, InspectionJob] = {}
+        self.replan_log: list[dict] = []
         for material_type, count in (release_plan or {}).items():
             self.release(material_type, count)
         self._refresh()
@@ -208,6 +230,35 @@ class AssemblyLine:
         )
         self.scrap_materials.append(material)
         self.ledger[material.serial_number] = MaterialState.SCRAPPED.value
+        self._retire_remaining_route(material, time, reason)
+
+    def _retire_remaining_route(self, material: Material, time: float, reason: str) -> None:
+        """实际失败后只重排受影响的剩余路线：取消该物料未开始/进行中的检测承诺，
+        已完成加工与已发生报废保持事实，其余物料的排队不受影响。"""
+        affected = []
+        for job in self.inspection_jobs.values():
+            if job.serial_number != material.serial_number:
+                continue
+            if job.state == JOB_QUEUED:
+                job.state = JOB_CANCELLED
+                job.cancel_reason = reason
+                job.end_time = time
+                affected.append(job.key)
+            elif job.state == JOB_ACTIVE:
+                job.state = JOB_FINISHED
+                job.end_time = time
+                job.result = "scrapped"
+                affected.append(job.key)
+        if affected:
+            self.replan_log.append(
+                {
+                    "time": time,
+                    "serial_number": material.serial_number,
+                    "reason": reason,
+                    "retired_jobs": affected,
+                }
+            )
+        self._maybe_start_inspections(time)
 
     def _handle_repaired(self, event: Event) -> None:
         index = self._station_index(event.source)
@@ -230,7 +281,190 @@ class AssemblyLine:
                 material.record(event.time, station.name, visit, "await_inspection", key=key)
                 self.pending_inspections[material.serial_number] = key
                 self.ledger[material.serial_number] = MaterialState.PENDING_INSPECTION.value
+                self._enqueue_inspection(material, station.name, visit, key, event.time)
         self._refresh()
+
+    def _resource_for(self, station_name: str) -> str:
+        return self._station_to_resource.get(station_name, station_name)
+
+    def _resource_in_outage(self, resource: str, time: float) -> bool:
+        return any(
+            start <= time < end
+            for start, end in self.inspection_outages.get(resource, [])
+        )
+
+    def _find_material(self, serial_number: str) -> Material | None:
+        for station in self.stations:
+            if station.material and station.material.serial_number == serial_number:
+                return station.material
+        for buffer in self.buffers:
+            for material in buffer.items:
+                if material.serial_number == serial_number:
+                    return material
+        return None
+
+    def _enqueue_inspection(
+        self, material: Material, station_name: str, visit: int, key: str, now: float,
+    ) -> InspectionJob:
+        material_type = self._type_of(material)
+        job = InspectionJob(
+            key=key,
+            serial_number=material.serial_number,
+            station=station_name,
+            visit=visit,
+            resource=self._resource_for(station_name),
+            priority=material_type.priority,
+            due=material_type.due,
+            estimated_duration=material_type.inspection_time,
+            enqueue_time=now,
+        )
+        self.inspection_jobs[key] = job
+        self._maybe_start_inspections(now)
+        return job
+
+    def _maybe_start_inspections(self, now: float) -> None:
+        resources = sorted({job.resource for job in self.inspection_jobs.values()})
+        for resource in resources:
+            while True:
+                active = [
+                    job for job in self.inspection_jobs.values()
+                    if job.resource == resource and job.state == JOB_ACTIVE
+                ]
+                if len(active) >= self.inspection_capacity:
+                    break
+                if self._resource_in_outage(resource, now):
+                    break
+                queued = [
+                    job for job in self.inspection_jobs.values()
+                    if job.resource == resource and job.state == JOB_QUEUED
+                ]
+                if not queued:
+                    break
+                job = min(queued, key=job_order_key)
+                job.state = JOB_ACTIVE
+                job.start_time = now
+                material = self._find_material(job.serial_number)
+                if material is not None:
+                    material.record(
+                        now, job.station, job.visit, "inspection_start",
+                        key=job.key, resource=resource,
+                    )
+
+    def _finish_inspection_job(self, key: str, time: float, result: str) -> None:
+        job = self.inspection_jobs.get(key)
+        if job is not None and job.state in (JOB_QUEUED, JOB_ACTIVE):
+            job.state = JOB_FINISHED
+            job.end_time = time
+            job.result = result
+        self._maybe_start_inspections(time)
+
+    def add_inspection_outage(self, resource: str, start: float, end: float) -> int:
+        if end <= start:
+            raise ValueError("outage end must be after start")
+        known = {self._resource_for(station.name) for station in self.stations}
+        if resource not in known:
+            raise ValueError(f"unknown inspection resource: {resource}")
+        self.inspection_outages.setdefault(resource, []).append([start, end])
+        return self._schedule(end, "INSPECTION_OUTAGE_END", resource)
+
+    def cancel_inspection(self, serial_number: str, station_name: str, visit: int) -> bool:
+        """取消尚未开始的检测承诺；已开始的必须等待明确结束，返回 False。"""
+        key = self._inspection_key(serial_number, station_name, visit)
+        job = self.inspection_jobs.get(key)
+        if job is None:
+            raise KeyError(f"unknown inspection job: {key}")
+        if job.state != JOB_QUEUED:
+            return False
+        now = self.clock.time
+        job.state = JOB_CANCELLED
+        job.cancel_reason = "cancelled_by_user"
+        job.end_time = now
+        self.inspection_log.append(
+            {
+                "time": now,
+                "serial_number": serial_number,
+                "station": station_name,
+                "visit": visit,
+                "result": None,
+                "action": "cancelled",
+                "reason": "cancelled_by_user",
+                "original_key": key,
+                "claimed_key": key,
+            }
+        )
+        if self.pending_inspections.get(serial_number) == key:
+            del self.pending_inspections[serial_number]
+            material = self._find_material(serial_number)
+            if material is not None:
+                material.record(
+                    now, station_name, visit, "inspection_cancelled", key=key,
+                )
+                material.state = MaterialState.IN_PROCESS
+            self.ledger[serial_number] = MaterialState.IN_PROCESS.value
+        self._refresh()
+        self._maybe_start_inspections(now)
+        return True
+
+    def plan_inspections(self, policy: str = "priority") -> dict:
+        jobs = [
+            job for job in self.inspection_jobs.values()
+            if job.state in (JOB_QUEUED, JOB_ACTIVE)
+        ]
+        return plan_inspections(
+            jobs, self.inspection_capacity, self.inspection_outages,
+            self.clock.time, policy,
+        )
+
+    def compare_inspection_policies(self) -> dict:
+        return {
+            policy: self.plan_inspections(policy)
+            for policy in ("fifo", "priority")
+        }
+
+    def inspection_conservation(self) -> dict:
+        jobs = list(self.inspection_jobs.values())
+        by_state = {JOB_QUEUED: 0, JOB_ACTIVE: 0, JOB_FINISHED: 0, JOB_CANCELLED: 0}
+        for job in jobs:
+            by_state[job.state] = by_state.get(job.state, 0) + 1
+        queue_ok = sum(by_state.values()) == len(jobs)
+        resource_ok = True
+        outage_ok = True
+        resources = sorted({job.resource for job in jobs})
+        for resource in resources:
+            intervals = [
+                (job.start_time, job.end_time)
+                for job in jobs
+                if job.resource == resource and job.start_time is not None
+            ]
+            points = sorted({p for pair in intervals for p in pair if p is not None})
+            for point in points:
+                overlap = sum(
+                    1 for start, end in intervals
+                    if start <= point and (end is None or point < end)
+                )
+                if overlap > self.inspection_capacity:
+                    resource_ok = False
+            active_count = sum(
+                1 for job in jobs
+                if job.resource == resource and job.state == JOB_ACTIVE
+            )
+            if active_count > self.inspection_capacity:
+                resource_ok = False
+            for job in jobs:
+                if (
+                    job.resource == resource
+                    and job.start_time is not None
+                    and self._resource_in_outage(resource, job.start_time)
+                ):
+                    outage_ok = False
+        return {
+            "jobs_total": len(jobs),
+            "by_state": by_state,
+            "queue_conserved": queue_ok,
+            "resource_conserved": resource_ok,
+            "outage_respected": outage_ok,
+            "material_conserved": self.accounts_balanced(),
+        }
 
     def schedule_inspection_result(
         self,
@@ -346,6 +580,13 @@ class AssemblyLine:
                 "round already finalized", claimed_key,
             )
             return
+        job = self.inspection_jobs.get(claimed_key)
+        if job is not None and job.state == JOB_QUEUED:
+            self._hold_indeterminate(
+                event, claimed_key,
+                "inspection has not started; resource commitment not active",
+            )
+            return
 
         index = self._station_index(station_name)
         station = self.stations[index]
@@ -361,6 +602,7 @@ class AssemblyLine:
         visit = material.visits.get(station.name, 0)
         record = DispositionRecord(claimed_key, event.time, station.name, visit, result)
         self.dispositions[claimed_key] = record
+        self._finish_inspection_job(claimed_key, event.time, result)
         if result == "pass":
             record.rework_count_after = material.rework_count
             material.record(event.time, station.name, visit, "inspection_pass", key=claimed_key)
@@ -409,6 +651,8 @@ class AssemblyLine:
         elif event.kind == "INSPECTION_RESULT":
             self._handle_inspection_result(event)
             self._refresh()
+        elif event.kind == "INSPECTION_OUTAGE_END":
+            self._maybe_start_inspections(event.time)
         else:
             raise ValueError(f"unknown event kind: {event.kind}")
         return event
@@ -474,6 +718,17 @@ class AssemblyLine:
         ]
         line.completed_by_type = dict(data.get("completed_by_type", {}))
         line.scrapped_by_type = dict(data.get("scrapped_by_type", {}))
+        line.inspection_capacity = data.get("inspection_capacity", 1)
+        line._station_to_resource = dict(data.get("station_to_resource", {}))
+        line.inspection_outages = {
+            key: [list(window) for window in value]
+            for key, value in data.get("inspection_outages", {}).items()
+        }
+        line.inspection_jobs = {
+            key: InspectionJob.from_dict(item)
+            for key, item in data.get("inspection_jobs", {}).items()
+        }
+        line.replan_log = list(data.get("replan_log", []))
         return line
 
     def to_dict(self) -> dict:
@@ -501,6 +756,16 @@ class AssemblyLine:
             "completed_materials": [material.to_dict() for material in self.completed_materials],
             "completed_by_type": dict(self.completed_by_type),
             "scrapped_by_type": dict(self.scrapped_by_type),
+            "inspection_capacity": self.inspection_capacity,
+            "station_to_resource": dict(self._station_to_resource),
+            "inspection_outages": {
+                key: [list(window) for window in value]
+                for key, value in self.inspection_outages.items()
+            },
+            "inspection_jobs": {
+                key: job.to_dict() for key, job in self.inspection_jobs.items()
+            },
+            "replan_log": list(self.replan_log),
         }
 
     @property

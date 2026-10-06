@@ -22,11 +22,23 @@
 - 返工在同一物料身份上累加 `rework_count`，达到 `max_reworks` 后报废并保留原因与全部加工历史。
 - `reconcile_by_type()` 按类型核对投入、在制、完成、报废；`material_history(serial)` 追溯单件轨迹。
 
+## 检测资源受限时的返工调度
+
+- 通过 `inspection_resources={"inspector-1": ["station-1", ...]}` 让多个加工工位共享同一检测工位，`inspection_capacity` 限制并发占用；不同物料、不同访问轮次的检测承诺（`InspectionJob`）在同一资源上排队。
+- `MaterialType` 新增 `priority`（交付优先级）、`due`（交付期限）、`inspection_time`（估计检测时长），用于排程与逾期判断。
+- `plan_inspections(policy)` / `compare_inspection_policies()` 是纯预测：按 fifo 或 priority 给出可执行顺序、总等待与逾期数量，不改动任何实际状态——预测通过不等于实际放行。
+- 检测结果仍按 `序列号|工位|轮次` 核对；旧轮次的迟到反馈不会提前释放当前检测占用，未开始检测的结果保留待定。
+- `add_inspection_outage(resource, start, end)` 声明工位临时停用区间：区间内不开始新检测，已开始的检测到明确结束为止，停用结束事件自动恢复排队。
+- `cancel_inspection(serial, station, visit)` 只取消尚未开始的检测承诺并释放排队；已开始的返回 False，必须等待明确结果结束。
+- 实际失败（检测 fail / 超返工上限 / 故障报废）后只退役该物料剩余路线上的检测承诺并记入 `replan_log`；已完成加工与已发生报废保持事实。
+- `inspection_conservation()` 核对队列守恒（queued+active+finished+cancelled = 全部承诺）、资源守恒（并发占用不超过容量）、停用区间尊重与物料账目守恒。
+
 ## 运行
 
 ```bash
 python demo.py
 python demo_multi_type.py
+python demo_inspection_scheduling.py
 python -m unittest discover -s tests -v
 ```
 
